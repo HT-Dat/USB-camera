@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>HDMI Screen</title>
+<style>
+  :root {
+    --bg: #000;
+    --panel: rgba(20, 26, 38, 0.92);
+    --text: #ffffff;
+    --muted: #a8b1c3;
+    --faint: #6f7a90;
+    --line: #3d4659;
+    --accent: #4fa3ff;
+    --on-accent: #0b1220;
+    --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden; touch-action: manipulation;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+  }
+  #stage { position: fixed; inset: 0; background: var(--bg); }
+  video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    background: var(--bg); object-fit: contain; pointer-events: none;
+  }
+  video[data-mode="stretch"] { object-fit: fill; }
+  video[data-mode="zoom"] { object-fit: cover; }
+
+  /* Start / status screen */
+  #status {
+    position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center;
+  }
+  #status[hidden] { display: none; }
+  .card { max-width: 520px; }
+  .card h1 { font-size: 26px; margin: 0 0 8px; font-weight: 650; }
+  .card p { color: var(--muted); margin: 0 0 20px; }
+  .card p.warn { color: var(--warn); }
+  .btn {
+    appearance: none; border: 1px solid var(--line); background: transparent; color: var(--text);
+    border-radius: 999px; padding: 10px 18px; font: inherit; font-size: 15px; cursor: pointer;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; padding: 12px 28px; font-size: 17px; }
+  .btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+
+  /* Settings panel */
+  #panel {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(520px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto;
+    background: var(--panel); border-radius: 16px; padding: 20px 24px;
+    backdrop-filter: blur(8px);
+  }
+  #panel[hidden] { display: none; }
+  #panel h2 { font-size: 15px; margin: 18px 0 8px; font-weight: 650; }
+  #panel h2:first-child { margin-top: 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .desc { color: var(--muted); font-size: 14px; margin: 8px 0 0; }
+  .info { color: var(--faint); font-size: 13px; margin-top: 16px; }
+  select {
+    width: 100%; font: inherit; font-size: 15px; color: var(--text); background: transparent;
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  }
+  select option { background: #141a26; }
+  #toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    background: var(--panel); padding: 8px 16px; border-radius: 999px; font-size: 14px;
+    opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+</div>
+
+<div id="status">
+  <div class="card">
+    <h1>HDMI Screen</h1>
+    <p id="statusText">Plug the HDMI capture dongle into the tablet, then tap Start.</p>
+    <button class="btn primary" id="startBtn">Start</button>
+  </div>
+</div>
+
+<div id="panel" hidden>
+  <h2>Scaling</h2>
+  <div class="row" id="modeRow"></div>
+  <p class="desc" id="modeDesc"></p>
+
+  <h2>Capture device</h2>
+  <select id="deviceSelect"></select>
+
+  <h2>Capture resolution</h2>
+  <div class="row" id="resRow"></div>
+
+  <div class="info" id="info"></div>
+
+  <div class="row" style="margin-top:20px">
+    <button class="btn" id="fsBtn">Full screen</button>
+    <button class="btn" id="closeBtn">Close</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+(() => {
+  const MODES = {
+    fit:     { label: "Fit",     desc: "Whole picture, correct shape. Black bars where the shapes differ." },
+    stretch: { label: "Stretch", desc: "Fills the screen, picture is stretched. Use with a 3:2 desktop on the laptop for a full, undistorted screen." },
+    zoom:    { label: "Zoom",    desc: "Fills the screen, correct shape. Edges of the picture are cut off." },
+  };
+  const RESOLUTIONS = [[1920, 1080], [1280, 720], [1024, 768], [640, 480]];
+  // Typical names of capture dongles (MacroSilicon MS2109/MS2130 and friends).
+  const DONGLE_HINT = /usb|uvc|capture|hdmi|video|ms21|macrosilicon|external/i;
+
+  const $ = (id) => document.getElementById(id);
+  const video = $("video");
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem("hdmi." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem("hdmi." + k, JSON.stringify(v)); } catch {} },
+  };
+
+  let mode = store.get("mode", "fit");
+  let res = store.get("res", [1920, 1080]);
+  let deviceId = store.get("deviceId", null);
+  let stream = null;
+  let wakeLock = null;
+  let started = false;
+
+  // ---------------------------------------------------------------- status / toast
+  function showStatus(text, { warn = false, button = null } = {}) {
+    $("statusText").textContent = text;
+    $("statusText").className = warn ? "warn" : "";
+    $("startBtn").hidden = !button;
+    if (button) $("startBtn").textContent = button;
+    $("status").hidden = false;
+  }
+  const hideStatus = () => { $("status").hidden = true; };
+
+  let toastTimer;
+  function toast(text) {
+    const t = $("toast");
+    t.textContent = text;
+    t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 1400);
+  }
+
+  // ---------------------------------------------------------------- camera
+  function stopStream() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    video.srcObject = null;
+  }
+
+  async function listCameras() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((d) => d.kind === "videoinput");
+  }
+
+  // Built-in tablet cameras are usually labelled "front"/"back" or "facing ...".
+  function looksBuiltIn(cam) {
+    return /front|back|rear|facing/i.test(cam.label);
+  }
+
+  function pickCamera(cams) {
+    const saved = cams.find((c) => c.deviceId === deviceId);
+    if (saved) return saved;
+    return cams.find((c) => DONGLE_HINT.test(c.label) && !looksBuiltIn(c))
+        || cams.find((c) => !looksBuiltIn(c))
+        || null;
+  }
+
+  async function openCamera(id) {
+    stopStream();
+    const constraints = {
+      audio: false,
+      video: {
+        width: { ideal: res[0] },
+        height: { ideal: res[1] },
+        frameRate: { ideal: 60 },
+        ...(id ? { deviceId: { exact: id } } : {}),
+      },
+    };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const track = stream.getVideoTracks()[0];
+    track.addEventListener("ended", onTrackEnded);
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    return track;
+  }
+
+  async function start() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      showStatus("This browser can't access cameras here. Open the page over https (or localhost) in Chrome.", { warn: true, button: "Retry" });
+      return;
+    }
+    showStatus("Looking for the capture dongle…");
+    try {
+      // First call asks for camera permission; device labels stay empty until then.
+      if (!started) {
+        const probe = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        probe.getTracks().forEach((t) => t.stop());
+      }
+      started = true;
+
+      const cams = await listCameras();
+      const cam = pickCamera(cams);
+      refreshDeviceSelect(cams, cam);
+      if (!cam) {
+        showStatus(
+          cams.length
+            ? "Only the tablet's built-in cameras are visible to the browser. This tablet doesn't pass USB cameras to Chrome, so use the HDMI Screen app instead."
+            : "No camera found. Plug in the capture dongle and tap Retry.",
+          { warn: true, button: "Retry" }
+        );
+        return;
+      }
+      await openCamera(cam.deviceId);
+      deviceId = cam.deviceId;
+      store.set("deviceId", deviceId);
+      hideStatus();
+      enterFullscreen();
+      keepAwake();
+      updateInfo();
+      if (!store.get("hintShown", false)) {
+        toast("Long-press for settings · double-tap to change scaling");
+        store.set("hintShown", true);
+      }
+    } catch (err) {
+      const denied = err && (err.name === "NotAllowedError" || err.name === "SecurityError");
+      showStatus(
+        denied
+          ? "Camera access was blocked. Allow it in the browser's site settings, then tap Retry."
+          : "Couldn't start video: " + (err && err.message ? err.message : err),
+        { warn: true, button: "Retry" }
+      );
+    }
+  }
+
+  function onTrackEnded() {
+    stopStream();
+    showStatus("The capture dongle was disconnected. Plug it back in.", { button: "Retry" });
+  }
+
+  // Restart automatically when the dongle is plugged back in.
+  navigator.mediaDevices?.addEventListener?.("devicechange", async () => {
+    if (!started || stream) return;
+    const cams = await listCameras().catch(() => []);
+    if (pickCamera(cams)) start();
+  });
+
+  // ---------------------------------------------------------------- full screen / wake lock
+  async function enterFullscreen() {
+    try {
+      if (!document.fullscreenElement) await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+      await screen.orientation?.lock?.("landscape");
+    } catch { /* needs a tap; the Full screen button covers it */ }
+  }
+
+  async function keepAwake() {
+    try {
+      if ("wakeLock" in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request("screen");
+        wakeLock.addEventListener("release", () => { wakeLock = null; });
+      }
+    } catch { /* not critical */ }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && stream) keepAwake();
+  });
+
+  // ---------------------------------------------------------------- settings
+  function setMode(m) {
+    mode = m;
+    video.dataset.mode = m;
+    store.set("mode", m);
+    renderPanel();
+  }
+
+  async function setResolution(w, h) {
+    res = [w, h];
+    store.set("res", res);
+    const track = stream?.getVideoTracks()[0];
+    if (track) {
+      try {
+        await track.applyConstraints({ width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: 60 } });
+      } catch {
+        await openCamera(deviceId).catch(() => {});
+      }
+    }
+    setTimeout(() => { updateInfo(); renderPanel(); }, 300);
+  }
+
+  function refreshDeviceSelect(cams, current) {
+    const sel = $("deviceSelect");
+    sel.textContent = "";
+    cams.forEach((c, i) => {
+      const o = document.createElement("option");
+      o.value = c.deviceId;
+      o.textContent = c.label || "Camera " + (i + 1);
+      if (current && c.deviceId === current.deviceId) o.selected = true;
+      sel.appendChild(o);
+    });
+  }
+
+  $("deviceSelect").addEventListener("change", async (e) => {
+    deviceId = e.target.value;
+    store.set("deviceId", deviceId);
+    try { await openCamera(deviceId); hideStatus(); } catch (err) { toast("Couldn't open that camera"); }
+    updateInfo();
+  });
+
+  function chip(label, pressed, onClick) {
+    const b = document.createElement("button");
+    b.className = "btn";
+    b.textContent = label;
+    b.setAttribute("aria-pressed", String(pressed));
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function renderPanel() {
+    const modeRow = $("modeRow");
+    modeRow.textContent = "";
+    Object.entries(MODES).forEach(([key, m]) => modeRow.appendChild(chip(m.label, key === mode, () => setMode(key))));
+    $("modeDesc").textContent = MODES[mode].desc;
+
+    const resRow = $("resRow");
+    resRow.textContent = "";
+    const s = currentSettings();
+    RESOLUTIONS.forEach(([w, h]) => {
+      const active = s ? s.width === w && s.height === h : res[0] === w && res[1] === h;
+      resRow.appendChild(chip(`${w}×${h}`, active, () => setResolution(w, h)));
+    });
+    updateInfo();
+  }
+
+  function currentSettings() {
+    const track = stream?.getVideoTracks()[0];
+    return track ? track.getSettings() : null;
+  }
+
+  function updateInfo() {
+    const s = currentSettings();
+    const vin = s && s.width ? `${s.width}×${s.height}${s.frameRate ? " @ " + Math.round(s.frameRate) + " fps" : ""}` : "—";
+    $("info").textContent = `Video in: ${vin}   ·   Screen: ${innerWidth}×${innerHeight} (${devicePixelRatio}x)`;
+  }
+
+  function openPanel() { renderPanel(); $("panel").hidden = false; }
+  function closePanel() { $("panel").hidden = true; }
+
+  $("closeBtn").addEventListener("click", closePanel);
+  $("fsBtn").addEventListener("click", () => { enterFullscreen(); closePanel(); });
+  $("startBtn").addEventListener("click", start);
+
+  // ---------------------------------------------------------------- gestures on the video
+  // Long-press: settings. Double-tap: cycle scaling. Tap: close settings.
+  const stage = $("stage");
+  let pressTimer = null, longPressed = false, lastTap = 0, tapTimer = null, startXY = null;
+
+  stage.addEventListener("pointerdown", (e) => {
+    longPressed = false;
+    startXY = [e.clientX, e.clientY];
+    clearTimeout(pressTimer);
+    pressTimer = setTimeout(() => {
+      longPressed = true;
+      $("panel").hidden ? openPanel() : closePanel();
+    }, 550);
+  });
+  stage.addEventListener("pointermove", (e) => {
+    if (startXY && Math.hypot(e.clientX - startXY[0], e.clientY - startXY[1]) > 12) clearTimeout(pressTimer);
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach((t) =>
+    stage.addEventListener(t, () => clearTimeout(pressTimer))
+  );
+  stage.addEventListener("pointerup", () => {
+    if (longPressed) return;
+    const now = Date.now();
+    if (now - lastTap < 300) {
+      clearTimeout(tapTimer);
+      lastTap = 0;
+      const keys = Object.keys(MODES);
+      setMode(keys[(keys.indexOf(mode) + 1) % keys.length]);
+      toast(MODES[mode].label);
+    } else {
+      lastTap = now;
+      tapTimer = setTimeout(() => { if (!$("panel").hidden) closePanel(); }, 300);
+    }
+  });
+  stage.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  addEventListener("resize", updateInfo);
+
+  // ---------------------------------------------------------------- init
+  video.dataset.mode = mode;
+  // Skip the Start tap when permission was already granted on an earlier visit.
+  navigator.permissions?.query({ name: "camera" }).then((p) => {
+    if (p.state === "granted") start();
+  }).catch(() => {});
+})();
+</script>
+</body>
+</html>
