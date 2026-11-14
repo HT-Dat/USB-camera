@@ -164,9 +164,10 @@
     return devices.filter((d) => d.kind === "videoinput");
   }
 
-  // Built-in tablet cameras are usually labelled "front"/"back" or "facing ...".
+  // Chrome on Android labels cameras "camera2 N, facing front|back|external".
+  // Only front/back are built in; a USB dongle shows up as "facing external".
   function looksBuiltIn(cam) {
-    return /front|back|rear|facing/i.test(cam.label);
+    return /front|back|rear/i.test(cam.label) && !/external/i.test(cam.label);
   }
 
   function pickCamera(cams) {
@@ -214,9 +215,10 @@
       const cam = pickCamera(cams);
       refreshDeviceSelect(cams, cam);
       if (!cam) {
+        const names = cams.map((c, i) => c.label || "Camera " + (i + 1)).join(" | ");
         showStatus(
           cams.length
-            ? "Only the tablet's built-in cameras are visible to the browser. This tablet doesn't pass USB cameras to Chrome, so use the HDMI Screen app instead."
+            ? "Only the tablet's built-in cameras are visible to the browser. This tablet doesn't pass USB cameras to Chrome, so use the HDMI Screen app instead. [Cameras: " + names + "]"
             : "No camera found. Plug in the capture dongle and tap Retry.",
           { warn: true, button: "Retry" }
         );
@@ -235,10 +237,11 @@
       }
     } catch (err) {
       const denied = err && (err.name === "NotAllowedError" || err.name === "SecurityError");
+      const detail = ` [${err && err.name}${err && err.message ? ": " + err.message : ""} · ${location.protocol}//${location.host || "local file"} · secure=${window.isSecureContext}]`;
       showStatus(
-        denied
+        (denied
           ? "Camera access was blocked. Allow it in the browser's site settings, then tap Retry."
-          : "Couldn't start video: " + (err && err.message ? err.message : err),
+          : "Couldn't start video.") + detail,
         { warn: true, button: "Retry" }
       );
     }
